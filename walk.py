@@ -1,9 +1,33 @@
+# -*- coding: utf-8 -*-
+# tof1_scan_and_move_full.py
+# ใช้ ToF1 (ดิบเป็น mm) + Gimbal สแกนหลายมุมเพื่อประเมินระยะ "ขวา/หน้า/ซ้าย"
+# จากนั้นตัดสินใจเคลื่อนที่ของ chassis ตามเงื่อนไขที่กำหนด
+#
+# มุมที่ใช้สแกน:
+#   ขวา (Right) : 90°, 60°
+#   หน้า (Front): 0°, 30°, -30°
+#   ซ้าย (Left) : -90°, -60°
+#
+# ลูปการทำงาน:
+#   1) สแกน ~5 วินาที -> ได้ค่าเฉลี่ยระยะของ Right/Front/Left (หน่วย m)
+#   2) เช็คเงื่อนไขและสั่งเคลื่อนที่
+#   3) ทำซ้ำ (Ctrl+C เพื่อหยุด)
+#
+# เงื่อนไขที่ผู้ใช้ต้องการเพิ่ม (มาก่อนกฎเดิม):
+#   (NEW-1) ถ้า Front < 0.20 m  -> ถอยหลัง 0.10 m
+#   (NEW-2) ถ้า Left  < 0.15 m  -> สไตรฟ์ขวา 0.10 m
+#   (NEW-3) ถ้า Right < 0.15 m  -> สไตรฟ์ซ้าย 0.10 m
+#
+# หมายเหตุ:
+# - โค้ดนี้ใช้เฉพาะ ToF1 (index 0) ที่อยู่หน้า gimbal แล้ว "หมุน gimbal" เพื่อมองซ้าย/หน้า/ขวา
+# - ค่าดิบจาก SDK เป็น "มิลลิเมตร (mm)" จะแปลงเป็น "เมตร (m)" ก่อนคำนวณ/แสดงผลเสมอ
+
 import time
 from statistics import mean
 from robomaster import robot
 
 # ===================== CONFIG =====================
-CONN_TYPE = "ap"          # "ap" ต่อ AP หุ่นโดยตรง | "sta" ผ่านเราเตอร์
+CONN_TYPE = "ap"           # "ap" ต่อ AP หุ่นโดยตรง | "sta" ผ่านเราเตอร์
 FREQ_HZ = 10               # ความถี่ที่ subscribe ToF (ครั้ง/วินาที)
 SAMPLE_PER_POSE = 3        # อ่านค่ากี่ครั้งต่อหนึ่ง "มุม" (ปรับเพิ่มเพื่อลด noise)
 DWELL_SEC = 0.10           # หน่วงหลังหมุน gimbal เพื่อรอหยุดนิ่ง (วินาที)
@@ -16,17 +40,17 @@ ANGLES_FRONT = [0, 30, -30]
 ANGLES_LEFT  = [-90, -60]
 
 # ค่ากำหนดการตัดสินใจ (เมตร)
-SIDE_CLOSE_TH = 0.30       # เกณฑ์ "ชิดผนัง" ด้านซ้าย/ขวา
-FRONT_NEAR_MIN = 0.20      # เกณฑ์หน้าใกล้ (ต่ำกว่านี้ให้หลบก่อน)
-FRONT_NEAR_MAX = 0.50
+SIDE_CLOSE_TH   = 0.30     # เกณฑ์ "ชิดผนัง" ด้านซ้าย/ขวา
+FRONT_NEAR_MIN  = 0.20     # เกณฑ์หน้าใกล้มาก (ต่ำกว่านี้ให้เลี่ยงทันที)
+FRONT_NEAR_MAX  = 0.50     # ช่วง 0.2–0.5 m เริ่มแคบ (พิจารณาเลี้ยว)
 
 # ระยะที่จะสั่งเคลื่อนที่ (เมตร)
 STEP_FORWARD_NARROW = 0.20 # ใช้ในกรณีซ้ายและขวาแคบทั้งคู่ (เดินหน้า)
 STEP_STRAFE_EDGE   = 0.10  # ใช้ในกรณีชิดข้างใดข้างหนึ่ง -> สไตรฟ์ไปด้านตรงข้าม
-TURN_DEG = 90              # องศาที่จะเลี้ยวซ้าย/ขวาเมื่อหน้าติด (ปรับได้)
+TURN_DEG = 90              # องศาที่จะเลี้ยวซ้าย/ขวาเมื่อหน้าติด (กฎเดิม)
 
 # ความเร็วการเคลื่อนที่ของ chassis
-XY_SPEED = 1               # ความเร็วเคลื่อนที่เชิงเส้น (m/s)
+XY_SPEED = 1               # ความเร็วเคลื่อนที่เชิงเส้น (m/s) *แนะนำลดเป็น 0.3–0.5 ในพื้นที่แคบ
 Z_SPEED  = 60              # ความเร็วการหมุน (deg/s)
 
 # เก็บค่าดิบล่าสุดของ ToF1 (mm) จาก callback
@@ -46,6 +70,10 @@ def measure_at_angle(ep_gimbal, yaw_deg):
     """
     หมุน gimbal ไปยังมุม yaw_deg (องศา) แล้วอ่านค่า ToF1 หลายครั้ง
     คืนค่า: ระยะ "เฉลี่ย" ของมุมนี้ในหน่วย "เมตร (m)"
+    ขั้นตอน:
+      1) หมุน gimbal -> รอหยุดนิ่ง (DWELL_SEC)
+      2) อ่านค่าดิบ mm ซ้ำ SAMPLE_PER_POSE ครั้ง
+      3) เฉลี่ย แล้วแปลง mm -> m
     """
     # หมุน gimbal (pitch = 0 เสมอ) แล้วรอให้หยุดนิ่ง
     ep_gimbal.moveto(pitch=0, yaw=yaw_deg,
@@ -66,6 +94,7 @@ def measure_at_angle(ep_gimbal, yaw_deg):
 def measure_direction(ep_gimbal, angles):
     """
     วัดระยะสำหรับ "หนึ่งทิศ" โดยวนวัดทุกมุมใน angles แล้วเฉลี่ยอีกชั้น
+    เหตุผล: เฉลี่ยสองชั้น (ต่อมุม และต่อทิศ) ช่วยลด noise และทำให้ค่าทิศนิ่งขึ้น
     """
     vals_m = []
     for ang in angles:
@@ -79,9 +108,8 @@ def measure_direction(ep_gimbal, angles):
 def scan_window(ep_gimbal, window_sec=SCAN_WINDOW_SEC):
     """
     สแกนภายในกรอบเวลา window_sec (~5 วินาที):
-    - ทำการ "ครบชุดทิศ" (Right -> Front -> Left) กี่ครั้งก็ได้เท่าที่เวลาพอ
-    - สุดท้ายเฉลี่ยค่าของแต่ละทิศจากทุกครั้งที่วัดได้ในช่วงเวลา
-    เหตุผล: ถ้าบางจังหวะอ่านไม่ทัน/แกว่ง จะมีหลายตัวอย่างช่วยให้ค่ากลางนิ่งขึ้น
+    - ทำ "ครบชุดทิศ" (Right -> Front -> Left) ซ้ำให้มากที่สุดเท่าที่เวลาเอื้อ
+    - เก็บค่าเฉลี่ยของแต่ละทิศจากหลายครั้งในช่วงเวลา เพื่อให้ค่าทิศนิ่งขึ้น
     """
     t0 = time.time()
     buf_right, buf_front, buf_left = [], [], []
@@ -99,7 +127,7 @@ def scan_window(ep_gimbal, window_sec=SCAN_WINDOW_SEC):
         if time.time() - t0 >= window_sec:
             break
 
-    # ถ้าไม่มีข้อมูลเลย ให้ลองวัดด่วนรอบเดียว (กันกรณีพลาด)
+    # กันกรณีพลาด: ถ้าไม่มีข้อมูลเลย ให้ลองวัดด่วนรอบเดียว
     if not buf_right and not buf_front and not buf_left:
         d_right = measure_direction(ep_gimbal, ANGLES_RIGHT)
         d_front = measure_direction(ep_gimbal, ANGLES_FRONT)
@@ -126,9 +154,31 @@ def decide_and_move(ep_chassis, ep_gimbal, d_right, d_front, d_left):
     - ทุกคำสั่ง move/turn จะ .wait_for_completed() เพื่อให้จบก่อนคาบถัดไป
     - หลัง "เลี้ยว" จะ recenter gimbal เพื่อให้หันไปด้านหน้าทิศใหม่เสมอ (หันตามการเลี้ยว)
     """
+
+    # -------------------- เงื่อนไขใหม่ที่ผู้ใช้ร้องขอ --------------------
+    # (NEW-1) ถ้า ToF ด้านหน้า < 0.20 m -> "ถอยหลัง" 0.10 m
+    if d_front is not None and d_front < 0.20:
+        print(f"[NEW RULE] Front={d_front:.2f} m < 0.20 -> BACKWARD 0.10 m")
+        ep_chassis.move(x=-0.10, y=0, z=0, xy_speed=XY_SPEED).wait_for_completed()
+        ep_gimbal.recenter().wait_for_completed()
+        return
+
+    # (NEW-2) ถ้า ToF ซ้าย < 0.15 m -> "สไตรฟ์ขวา" 0.10 m (ออกห่างผนังซ้าย)
+    if d_left is not None and d_left < 0.15:
+        print(f"[NEW RULE] Left={d_left:.2f} m < 0.15 -> STRAFE RIGHT 0.10 m")
+        ep_chassis.move(x=0, y=+0.10, z=0, xy_speed=XY_SPEED).wait_for_completed()
+        return
+
+    # (NEW-3) ถ้า ToF ขวา < 0.15 m -> "สไตรฟ์ซ้าย" 0.10 m (ออกห่างผนังขวา)
+    if d_right is not None and d_right < 0.15:
+        print(f"[NEW RULE] Right={d_right:.2f} m < 0.15 -> STRAFE LEFT 0.10 m")
+        ep_chassis.move(x=0, y=-0.10, z=0, xy_speed=XY_SPEED).wait_for_completed()
+        return
+    # -------------------- จบส่วนที่เพิ่มใหม่ --------------------
+
+    # -------------------- ตรรกะเดิม (คงไว้) --------------------
     # ความปลอดภัย: ถ้าหน้าใกล้มากกว่าเกณฑ์ (front < 0.2 m) -> ห้ามเดินหน้า ให้เลี้ยวหลบ
     if d_front is not None and d_front < FRONT_NEAR_MIN:
-        # เลือกเลี้ยวไปด้านที่ "กว้างกว่า" (ระยะมากกว่า)
         turn_dir = "left" if (d_left or 0) > (d_right or 0) else "right"
         print(f"[SAFETY] Front={d_front:.2f} m ใกล้มาก! เลี้ยว{turn_dir} {TURN_DEG}°")
         if turn_dir == "left":
@@ -136,7 +186,7 @@ def decide_and_move(ep_chassis, ep_gimbal, d_right, d_front, d_left):
         else:
             ep_chassis.move(x=0, y=0, z=-TURN_DEG, z_speed=Z_SPEED).wait_for_completed()
         ep_gimbal.recenter().wait_for_completed()
-        return  # จบการตัดสินใจรอบนี้
+        return
 
     # เงื่อนไข 4 และ 5: ถ้าหน้าอยู่ในช่วง 0.2–0.5 m ให้เลี้ยวตามด้านชิด
     if d_front is not None and (FRONT_NEAR_MIN <= d_front <= FRONT_NEAR_MAX):
@@ -151,21 +201,21 @@ def decide_and_move(ep_chassis, ep_gimbal, d_right, d_front, d_left):
             ep_gimbal.recenter().wait_for_completed()
             return
 
-    # เงื่อนไข 1: ซ้าย<0.3 และ ขวา<0.3 -> เดินหน้า 0.3 m
+    # เงื่อนไข 1 เดิม: ซ้าย<0.3 และ ขวา<0.3 -> เดินหน้า
     if (d_left is not None and d_left < SIDE_CLOSE_TH) and (d_right is not None and d_right < SIDE_CLOSE_TH):
-        print(f"[FWD 0.30] Left={d_left:.2f} m & Right={d_right:.2f} m < 0.3")
+        print(f"[FWD {STEP_FORWARD_NARROW:.2f}] Left={d_left:.2f} m & Right={d_right:.2f} m < 0.3")
         ep_chassis.move(x=+STEP_FORWARD_NARROW, y=0, z=0, xy_speed=XY_SPEED).wait_for_completed()
         return
 
-    # เงื่อนไข 2 (ปรับ): ซ้ายชิด (<0.3) และขวากว้าง (>0.3) -> สไตรฟ์ขวา 0.10 m
+    # เงื่อนไข 2 เดิม (ปรับพฤติกรรมเป็นสไตรฟ์): ซ้าย<0.3 และขวา>0.3 -> สไตรฟ์ขวา 0.10 m
     if (d_left is not None and d_left < SIDE_CLOSE_TH) and (d_right is not None and d_right > SIDE_CLOSE_TH):
-        print(f"[STRAFE RIGHT 0.10] Left={d_left:.2f} m <0.3 & Right={d_right:.2f} m >0.3")
+        print(f"[STRAFE RIGHT {STEP_STRAFE_EDGE:.2f}] Left={d_left:.2f} m <0.3 & Right={d_right:.2f} m >0.3")
         ep_chassis.move(x=0, y=+STEP_STRAFE_EDGE, z=0, xy_speed=XY_SPEED).wait_for_completed()
         return
 
-    # เงื่อนไข 3 (ปรับ): ขวาชิด (<0.3) และซ้ายกว้าง (>0.3) -> สไตรฟ์ซ้าย 0.10 m
+    # เงื่อนไข 3 เดิม (ปรับพฤติกรรมเป็นสไตรฟ์): ขวา<0.3 และซ้าย>0.3 -> สไตรฟ์ซ้าย 0.10 m
     if (d_right is not None and d_right < SIDE_CLOSE_TH) and (d_left is not None and d_left > SIDE_CLOSE_TH):
-        print(f"[STRAFE LEFT 0.10] Right={d_right:.2f} m <0.3 & Left={d_left:.2f} m >0.3")
+        print(f"[STRAFE LEFT {STEP_STRAFE_EDGE:.2f}] Right={d_right:.2f} m <0.3 & Left={d_left:.2f} m >0.3")
         ep_chassis.move(x=0, y=-STEP_STRAFE_EDGE, z=0, xy_speed=XY_SPEED).wait_for_completed()
         return
 
@@ -192,7 +242,7 @@ def main():
     print("เริ่มลูป: สแกน 5 วิ → ตัดสินใจ → เคลื่อนที่ → ทำซ้ำ (Ctrl+C เพื่อหยุด)")
     try:
         while True:
-            # 1) สแกนภายใน 5 วินาที ได้ค่าเฉลี่ยของแต่ละทิศ (เมตร)
+            # 1) สแกนภายใน ~5 วินาที ได้ค่าเฉลี่ยของแต่ละทิศ (เมตร)
             d_right, d_front, d_left = scan_window(ep_gimbal, SCAN_WINDOW_SEC)
             if None in (d_right, d_front, d_left):
                 print("[WARN] สแกนไม่ครบทุกทิศ ลองใหม่ในรอบถัดไป")
@@ -203,7 +253,7 @@ def main():
             # 2) ตัดสินใจและสั่งเคลื่อนที่ตามเงื่อนไข
             decide_and_move(ep_chassis, ep_gimbal, d_right, d_front, d_left)
 
-            # 3) (ออปชัน) เว้นระยะสั้น ๆ ก่อนเริ่มสแกนรอบใหม่
+            # 3) เว้นระยะสั้น ๆ ก่อนเริ่มสแกนรอบใหม่ (กันคำสั่งติดกันเกินไป)
             time.sleep(0.2)
 
     except KeyboardInterrupt:
@@ -220,5 +270,5 @@ def main():
             pass
         ep.close()
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()
