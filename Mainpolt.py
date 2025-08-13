@@ -12,6 +12,7 @@ PATH_CSV = "path_log.csv"   # ถ้าไม่มีไฟล์ จะวา�
 # ============ ปรับได้ ============
 CELL_SIZE_M = 0.6   # ขนาด 1 ช่อง (เมตร)
 STEP_STARTS_AT_ZERO = True   # ให้สเต็ปเริ่มที่ 0 แล้วนับเฉพาะ event=move
+MARKER_OUTSET_CELLS = 0.14   # ระยะดันดาว “ออกนอกกำแพง” (หน่วยเป็นจำนวนช่อง)
 # ===============================
 
 # -------------------- helpers --------------------
@@ -35,7 +36,7 @@ def _read_map(filename):
                 "W": _bool(row["wall_W"]),
             }
             cells[(x,y)] = walls
-            # marker ในไฟล์แมป (ไม่ใช้ในงานนี้)
+            # marker ในไฟล์แมป (ใช้วาดด้วย)
             m = {k: (row.get(f"mark_{k}") or "").strip() for k in "NESW"}
             m = {k:(None if (v=="" or v.upper()=="FALSE") else v) for k,v in m.items()}
             marks[(x,y)] = m
@@ -47,7 +48,7 @@ def _read_path(filename):
         return [], None, []
 
     moves = []
-    candidates = []  # ไม่ใช้ในงานนี้
+    candidates = []
     start_cell = None
 
     with open(filename, newline="", encoding="utf-8") as f:
@@ -69,7 +70,7 @@ def _read_path(filename):
         cids = col("ids")
         cnote = col("note")
 
-        step_counter =  0
+        step_counter = -1 if STEP_STARTS_AT_ZERO else 0
 
         for r in rdr:
             ev = (r.get(c_event) or "").strip().lower() if c_event else ""
@@ -114,7 +115,7 @@ def _safe_int(v):
 
 def _cell_center(x,y): return x+0.5, y+0.5
 
-# ====== ฟังก์ชันเกี่ยวกับทิศ/กำแพง ======
+# ====== ฟังก์ชันเกี่ยวกับทิศ/กำแพง/ตำแหน่งบนกำแพง ======
 def _direction(a, b):
     """คืนทิศ N/E/S/W ตาม delta ระหว่าง cell a->b (ต้องเป็นเพื่อนบ้าน 4-ทิศ)"""
     (x1, y1), (x2, y2) = a, b
@@ -129,11 +130,7 @@ def _opposite(side):
     return {"N":"S","S":"N","E":"W","W":"E"}.get(side)
 
 def _carve_walls_along_path(cells, path):
-    """
-    ลบกำแพงที่อยู่ระหว่างเซลล์ที่มีการเดินผ่าน (a->b) สำหรับทุกเซกเมนต์ใน path
-    - ต้องเป็นเพื่อนบ้าน 4-ทิศเท่านั้น จึงจะรู้ว่าขอบไหน
-    - จะลบทั้งฝั่งออกของ a และฝั่งเข้าของ b
-    """
+    """ลบกำแพงที่อยู่ระหว่างเซลล์ที่มีการเดินผ่าน (a->b)"""
     carved = 0
     skipped = 0
     for seg in path:
@@ -143,11 +140,9 @@ def _carve_walls_along_path(cells, path):
             continue
         side = _direction(a, b)
         if side is None:
-            # ไม่ใช่เพื่อนบ้าน 4-ทิศ (เช่น กระโดดข้ามหลายช่อง) ข้าม
             skipped += 1
             continue
         opp = _opposite(side)
-        # ลบกำแพงทั้งสองด้าน
         if cells[a].get(side, False):
             cells[a][side] = False
             carved += 1
@@ -156,10 +151,27 @@ def _carve_walls_along_path(cells, path):
             carved += 1
     return carved, skipped
 
+def _wall_midpoint(x,y,side):
+    """ตำแหน่งกึ่งกลางกำแพง (ด้านใน cell)"""
+    if side=="N": return (x+0.5, y+1.0)
+    if side=="S": return (x+0.5, y+0.0)
+    if side=="E": return (x+1.0, y+0.5)
+    if side=="W": return (x+0.0, y+0.5)
+    return (x+0.5, y+0.5)
+
+def _side_normal(side):
+    """เวกเตอร์ตั้งฉากออกจาก cell"""
+    return {
+        "N": (0, +1),
+        "S": (0, -1),
+        "E": (+1, 0),
+        "W": (-1, 0),
+    }.get(side, (0,0))
+
 # -------------------- plotting --------------------
 def plot_map_and_path(map_csv=MAP_CSV, path_csv=PATH_CSV):
-    cells, _marks_unused = _read_map(map_csv)
-    path, start_cell, _candidates_unused = _read_path(path_csv)
+    cells, marks_from_map = _read_map(map_csv)
+    path, start_cell, candidates = _read_path(path_csv)
 
     # 1) เจาะกำแพงตามเส้นทางก่อนวาด
     carved, skipped = _carve_walls_along_path(cells, path)
@@ -181,21 +193,17 @@ def plot_map_and_path(map_csv=MAP_CSV, path_csv=PATH_CSV):
         if walls.get("S"): ax.plot([x, x+1],[y, y],     linewidth=2, color="red")
         if walls.get("W"): ax.plot([x, x],[y, y+1],     linewidth=2, color="red")
 
-    # 3) วาด “เส้นยาวๆ” แสดงทางเดิน (polyline ต่อเนื่องผ่าน center ของแต่ละเซลล์)
+    # 3) วาด “เส้นยาวๆ” แสดงทางเดิน (polyline ต่อเนื่องผ่าน center)
     if path:
-        # จุดเริ่ม + จุดปลายแต่ละสเต็ป
         pts = []
-        # จุดแรก: center ของ from ในสเต็ปแรก
         first_from = path[0]["from"]
         pts.append(_cell_center(*first_from))
-        # ต่อด้วย center ของ to ของทุกเซกเมนต์ตามลำดับ
         for seg in path:
             pts.append(_cell_center(*seg["to"]))
-
         xs, ys = zip(*pts)
-        ax.plot(xs, ys, linewidth=2.5, alpha=0.95 ,color="white")  # polyline ยาวๆ
+        ax.plot(xs, ys, linewidth=2.5, alpha=0.95, color="white")  # เปลี่ยนสีได้ด้วย color="..."
 
-    # 4) เขียนตัวเลขสเต็ปในช่องปลายทาง (ตามเดิม)
+    # 4) เขียนตัวเลขสเต็ปในช่องปลายทาง
     step_labels = defaultdict(list)
     for seg in path:
         step_labels[seg["to"]].append(seg["step"])
@@ -206,17 +214,60 @@ def plot_map_and_path(map_csv=MAP_CSV, path_csv=PATH_CSV):
         for j,t in enumerate(labels):
             ax.text(cx, y0 - j*line_h, str(t),
                     ha="center", va="center",
-                    fontsize=10,
-                    color="black",
+                    fontsize=10, color="black",
                     bbox=dict(facecolor="white", alpha=0.9, lw=0, pad=0.8))
 
-    # 5) แสดงจุดเริ่มเป็น “0” (ไม่ต้องมี END)
+    # 5) แสดงจุดเริ่มเป็น “0”
     if path:
         ax.text(*_cell_center(*path[0]["from"]), "0",
                 color="green", ha="center", va="center",
                 fontsize=10, fontweight="bold")
 
-    # 6) ตั้งค่าแกน/ขอบเขต
+    # 6) วาด MARKERS (รูปดาว + ค่าด้านล่าง + ทิศ)
+    #    รวมทั้งจาก map_data (confirmed) และ marker_candidate (candidate)
+    #    - confirmed = สีน้ำเงิน
+    #    - candidate = สีเทา
+    inferred = []
+
+    # 6.1 จากไฟล์ map_data (ถือว่า confirmed)
+    for (x,y), mdict in marks_from_map.items():
+        for side in "NESW":
+            ids = mdict.get(side)
+            if ids:
+                inferred.append({"cell": (x,y), "side": side, "ids": ids, "confirmed": True})
+
+    # 6.2 จาก marker_candidate ใน path_log (ถ้ามี)
+    for c in candidates:
+        (x,y) = c["cell"]
+        side  = c["side"] if c["side"] in "NESW" else None
+        ids   = (c["ids"] or "").strip()
+        if x is None or y is None or not side or not ids:
+            continue
+        inferred.append({"cell": (x,y), "side": side, "ids": ids, "confirmed": False})
+
+    # 6.3 วาดดาว + ข้อความ
+    for mk in inferred:
+        (x,y), side, ids, confirmed = mk["cell"], mk["side"], mk["ids"], mk["confirmed"]
+
+        # จุดกึ่งกลางกำแพง แล้วดันออกนอกกำแพงเล็กน้อย
+        wx, wy = _wall_midpoint(x, y, side)
+        nx, ny = _side_normal(side)
+        px, py = wx + nx*MARKER_OUTSET_CELLS, wy + ny*MARKER_OUTSET_CELLS
+
+        # ดาว
+        ax.plot(px, py, marker="*", markersize=10,
+                color=("tab:blue" if confirmed else "gray"),
+                alpha=0.95, zorder=5)
+
+        # ข้อความใต้ดาว: "<ids> (<side>)"
+        label = f"{ids} ({side})"
+        ax.text(px, py - 0.12, label,
+                ha="center", va="top",
+                fontsize=9, color="black",
+                bbox=dict(facecolor="white", alpha=0.9, lw=0, pad=0.6),
+                zorder=6)
+
+    # 7) ตั้งค่าแกน/ขอบเขต
     if cells:
         xs = [x for (x,_) in cells.keys()]
         ys = [y for (_,y) in cells.keys()]
@@ -227,16 +278,15 @@ def plot_map_and_path(map_csv=MAP_CSV, path_csv=PATH_CSV):
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.grid(False)
-    ax.set_title("Map + Path Polyline — Walls carved along the walked edges")
+    ax.set_title("Map + Path Polyline + Star Markers (value below with direction)")
 
     plt.tight_layout()
     plt.show()
 
-    # 7) รายงานผลการเจาะกำแพงเล็กน้อยในคอนโซล (ช่วย debug)
+    # 8) รายงานผลการเจาะกำแพง (debug)
     print(f"Carved walls: {carved} segments removed; Skipped non-adjacent/invalid moves: {skipped}")
 
 if __name__ == "__main__":
     if not os.path.exists(MAP_CSV):
         raise SystemExit(f"ไม่พบไฟล์ {MAP_CSV}")
     plot_map_and_path(MAP_CSV, PATH_CSV)
-
